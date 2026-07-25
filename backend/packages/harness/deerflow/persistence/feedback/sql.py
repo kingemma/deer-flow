@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from deerflow.persistence.feedback.model import FeedbackRow
 from deerflow.runtime.user_context import AUTO, _AutoSentinel, resolve_user_id
+from deerflow.utils.time import coerce_iso
 
 
 class FeedbackRepository:
@@ -24,7 +25,8 @@ class FeedbackRepository:
         d = row.to_dict()
         val = d.get("created_at")
         if isinstance(val, datetime):
-            d["created_at"] = val.isoformat()
+            # SQLite drops tzinfo on read; normalize via ``coerce_iso`` so output is always tz-aware.
+            d["created_at"] = coerce_iso(val)
         return d
 
     async def create(
@@ -194,6 +196,27 @@ class FeedbackRepository:
         """Return feedback grouped by run_id for a thread: {run_id: feedback_dict}."""
         resolved_user_id = resolve_user_id(user_id, method_name="FeedbackRepository.list_by_thread_grouped")
         stmt = select(FeedbackRow).where(FeedbackRow.thread_id == thread_id)
+        if resolved_user_id is not None:
+            stmt = stmt.where(FeedbackRow.user_id == resolved_user_id)
+        async with self._sf() as session:
+            result = await session.execute(stmt)
+            return {row.run_id: self._row_to_dict(row) for row in result.scalars()}
+
+    async def list_by_run_ids(
+        self,
+        thread_id: str,
+        run_ids: set[str],
+        *,
+        user_id: str | None | _AutoSentinel = AUTO,
+    ) -> dict[str, dict]:
+        """Return feedback for only the selected runs in one thread."""
+        if not run_ids:
+            return {}
+        resolved_user_id = resolve_user_id(user_id, method_name="FeedbackRepository.list_by_run_ids")
+        stmt = select(FeedbackRow).where(
+            FeedbackRow.thread_id == thread_id,
+            FeedbackRow.run_id.in_(run_ids),
+        )
         if resolved_user_id is not None:
             stmt = stmt.where(FeedbackRow.user_id == resolved_user_id)
         async with self._sf() as session:

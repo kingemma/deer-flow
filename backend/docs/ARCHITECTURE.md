@@ -63,7 +63,8 @@ The agent runtime is embedded in the FastAPI Gateway and built on LangGraph for 
 - Tool execution orchestration
 - SSE streaming for real-time responses
 
-**Graph registry**: `langgraph.json` remains available for tooling and Studio compatibility.
+**Graph registry**: `langgraph.json` remains available for tooling, Studio, or direct LangGraph Server compatibility.
+It is not the default service entrypoint; scripts and Docker deployments run the Gateway embedded runtime.
 
 ```json
 {
@@ -426,17 +427,17 @@ SKILL.md Format:
 ### Configuration Reload
 
 ```
-1. Client updates MCP config
+1. Client updates MCP config or requests a cache reset
    PUT /api/mcp/config
+   POST /api/mcp/cache/reset
 
-2. Gateway writes extensions_config.json
-   - Updates mcpServers section
-   - File mtime changes
+2. Gateway updates runtime state
+   - PUT writes extensions_config.json and reloads configuration
+   - Both endpoints reset the MCP tools cache and persistent sessions
 
-3. MCP Manager detects change
-   - get_cached_mcp_tools() checks mtime
-   - If changed: reinitializes MCP client
-   - Loads updated server configurations
+3. MCP Manager reloads on next use
+   - get_cached_mcp_tools() lazily reinitializes MCP tools
+   - Loads current server configurations and tool lists
 
 4. Next agent run uses new tools
 ```

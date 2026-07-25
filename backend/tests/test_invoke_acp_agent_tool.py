@@ -1,6 +1,9 @@
 """Tests for the built-in ACP invocation tool."""
 
+import asyncio
+import contextlib
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -699,6 +702,92 @@ def test_get_available_tools_includes_invoke_acp_agent_when_agents_configured(mo
     load_acp_config_from_dict({})
 
 
+def test_get_available_tools_sync_invoke_acp_agent_preserves_thread_workspace(monkeypatch, tmp_path):
+    from deerflow.config import paths as paths_module
+    from deerflow.runtime import user_context as uc_module
+
+    monkeypatch.setattr(paths_module, "get_paths", lambda: paths_module.Paths(base_dir=tmp_path))
+    monkeypatch.setattr(uc_module, "get_effective_user_id", lambda: None)
+    monkeypatch.setattr(
+        "deerflow.config.extensions_config.ExtensionsConfig.from_file",
+        classmethod(lambda cls: ExtensionsConfig(mcp_servers={}, skills={})),
+    )
+    monkeypatch.setattr("deerflow.tools.tools.is_host_bash_allowed", lambda config=None: True)
+
+    captured: dict[str, object] = {}
+
+    class DummyClient:
+        @property
+        def collected_text(self) -> str:
+            return "ok"
+
+        async def session_update(self, session_id, update, **kwargs):
+            pass
+
+        async def request_permission(self, options, session_id, tool_call, **kwargs):
+            raise AssertionError("should not be called")
+
+    class DummyConn:
+        async def initialize(self, **kwargs):
+            pass
+
+        async def new_session(self, **kwargs):
+            return SimpleNamespace(session_id="s1")
+
+        async def prompt(self, **kwargs):
+            pass
+
+    class DummyProcessContext:
+        def __init__(self, client, cmd, *args, env=None, cwd):
+            captured["cwd"] = cwd
+
+        async def __aenter__(self):
+            return DummyConn(), object()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setitem(
+        sys.modules,
+        "acp",
+        SimpleNamespace(
+            PROTOCOL_VERSION="2026-03-24",
+            Client=DummyClient,
+            spawn_agent_process=lambda client, cmd, *args, env=None, cwd: DummyProcessContext(client, cmd, *args, env=env, cwd=cwd),
+            text_block=lambda text: {"type": "text", "text": text},
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "acp.schema",
+        SimpleNamespace(
+            ClientCapabilities=lambda: {},
+            Implementation=lambda **kwargs: kwargs,
+            TextContentBlock=type("TextContentBlock", (), {"__init__": lambda self, text: setattr(self, "text", text)}),
+        ),
+    )
+
+    explicit_config = SimpleNamespace(
+        tools=[],
+        models=[],
+        tool_search=SimpleNamespace(enabled=False),
+        skill_evolution=SimpleNamespace(enabled=False),
+        sandbox=SimpleNamespace(),
+        get_model_config=lambda name: None,
+        acp_agents={"codex": ACPAgentConfig(command="codex-acp", description="Codex CLI")},
+    )
+    tools = get_available_tools(include_mcp=False, subagent_enabled=False, app_config=explicit_config)
+    tool = next(tool for tool in tools if tool.name == "invoke_acp_agent")
+
+    thread_id = "thread-sync-123"
+    tool.invoke(
+        {"agent": "codex", "prompt": "Do something"},
+        config={"configurable": {"thread_id": thread_id}},
+    )
+
+    assert captured["cwd"] == str(tmp_path / "threads" / thread_id / "acp-workspace")
+
+
 def test_get_available_tools_uses_explicit_app_config_for_acp_agents(monkeypatch):
     explicit_agents = {"codex": ACPAgentConfig(command="codex-acp", description="Codex CLI")}
     explicit_config = SimpleNamespace(
@@ -727,3 +816,103 @@ def test_get_available_tools_uses_explicit_app_config_for_acp_agents(monkeypatch
 
     assert captured["agents"] is explicit_agents
     assert "invoke_acp_agent" in [tool.name for tool in tools]
+
+
+# ---------------------------------------------------------------------------
+# Regression: invoke_acp_agent must not hang forever on a stuck prompt() call
+# ---------------------------------------------------------------------------
+#
+# A minimal, real ACP agent subprocess that answers `initialize`/`new_session`
+# correctly but then hangs forever inside `prompt()` (never responds). This
+# reproduces an agent that has finished the ACP handshake but then wedges —
+# e.g. stuck on a runaway internal step — instead of a mocked `acp` module,
+# so the regression test below exercises the real spawn/kill subprocess path.
+_HUNG_ACP_AGENT_SCRIPT = """\
+import asyncio
+
+import acp
+from acp.schema import InitializeResponse, NewSessionResponse
+
+
+class _HungAgent:
+    async def initialize(self, protocol_version, client_capabilities=None, client_info=None, **kwargs):
+        return InitializeResponse(protocol_version=protocol_version)
+
+    async def new_session(self, cwd, additional_directories=None, mcp_servers=None, **kwargs):
+        return NewSessionResponse(session_id="hung-session")
+
+    async def prompt(self, session_id, prompt, **kwargs):
+        # Deliberately never respond: simulates an ACP agent that completes the
+        # handshake but then hangs instead of answering session/prompt.
+        await asyncio.Event().wait()
+
+
+asyncio.run(acp.run_agent(_HungAgent()))
+"""
+
+
+@pytest.mark.anyio
+async def test_invoke_acp_agent_times_out_and_kills_hung_subprocess(monkeypatch, tmp_path):
+    """invoke_acp_agent must time out and kill the subprocess instead of hanging
+    forever when the agent answers initialize/new_session but then never
+    responds to session/prompt.
+
+    Before the timeout_seconds fix, neither this tool nor ACPAgentConfig had
+    any timeout, so this exact scenario blocked the tool call — and therefore
+    the whole agent turn — indefinitely, with the child process left running.
+
+    `timeout_seconds` is configured small (2s) so the pass-after run completes
+    in a couple of seconds. The outer `asyncio.wait_for(..., timeout=20)` is
+    only a test-level safety net: it must never fire in the pass-after case
+    (elapsed stays well under it), but bounds this test to ~20s instead of
+    hanging the whole suite forever if the fix regresses.
+    """
+    import acp as acp_module
+
+    from deerflow.config import paths as paths_module
+
+    monkeypatch.setattr(paths_module, "get_paths", lambda: paths_module.Paths(base_dir=tmp_path))
+    monkeypatch.setattr(
+        "deerflow.config.extensions_config.ExtensionsConfig.from_file",
+        classmethod(lambda cls: ExtensionsConfig(mcp_servers={}, skills={})),
+    )
+
+    script_path = tmp_path / "hung_acp_agent.py"
+    script_path.write_text(_HUNG_ACP_AGENT_SCRIPT, encoding="utf-8")
+
+    captured: dict[str, object] = {}
+    real_spawn_agent_process = acp_module.spawn_agent_process
+
+    # Spy on the real spawn_agent_process (not a fake) so we can inspect the
+    # actual asyncio.subprocess.Process afterwards, while every bit of real
+    # spawn/handshake/cleanup behavior stays exactly as production uses it.
+    @contextlib.asynccontextmanager
+    async def _spying_spawn_agent_process(client, cmd, *args, env=None, cwd=None):
+        async with real_spawn_agent_process(client, cmd, *args, env=env, cwd=cwd) as (conn, proc):
+            captured["proc"] = proc
+            yield conn, proc
+
+    monkeypatch.setattr(acp_module, "spawn_agent_process", _spying_spawn_agent_process)
+
+    tool = build_invoke_acp_agent_tool(
+        {
+            "hung": ACPAgentConfig(
+                command=sys.executable,
+                args=[str(script_path)],
+                description="Hung test agent",
+                timeout_seconds=2,
+            )
+        }
+    )
+
+    start = time.monotonic()
+    result = await asyncio.wait_for(tool.coroutine(agent="hung", prompt="do work"), timeout=20)
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 10, f"expected the configured 2s timeout to fire quickly, took {elapsed:.1f}s"
+    assert "timed out" in result.lower()
+    assert "hung" in result
+
+    proc = captured.get("proc")
+    assert proc is not None, "spawn_agent_process spy did not capture the subprocess"
+    assert proc.returncode is not None, "subprocess must be terminated, not left running after a timeout"

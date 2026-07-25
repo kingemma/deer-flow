@@ -6,8 +6,8 @@ from deerflow.config import get_app_config
 from deerflow.config.app_config import AppConfig
 from deerflow.reflection import resolve_variable
 from deerflow.sandbox.security import is_host_bash_allowed
-from deerflow.tools.builtins import ask_clarification_tool, present_file_tool, task_tool, view_image_tool
-from deerflow.tools.builtins.tool_search import reset_deferred_registry
+from deerflow.tools.builtins import ask_clarification_tool, list_uploaded_files, present_file_tool, review_skill_package, task_tool, view_image_tool
+from deerflow.tools.mcp_metadata import tag_mcp_tool
 from deerflow.tools.sync import make_sync_tool_wrapper
 
 logger = logging.getLogger(__name__)
@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 BUILTIN_TOOLS = [
     present_file_tool,
     ask_clarification_tool,
+    review_skill_package,
 ]
 
 SUBAGENT_TOOLS = [
@@ -47,6 +48,7 @@ def get_available_tools(
     model_name: str | None = None,
     subagent_enabled: bool = False,
     *,
+    include_upload_tool: bool = True,
     app_config: AppConfig | None = None,
 ) -> list[BaseTool]:
     """Get all available tools from config.
@@ -59,6 +61,9 @@ def get_available_tools(
         include_mcp: Whether to include tools from MCP servers (default: True).
         model_name: Optional model name to determine if vision tools should be included.
         subagent_enabled: Whether to include subagent tools (task, task_status).
+        include_upload_tool: Whether to include ``list_uploaded_files`` (default: True).
+            Set to False for subagent tool assembly — subagents have independent
+            ThreadState and cannot exclude current-run files.
 
     Returns:
         List of available tools.
@@ -89,6 +94,8 @@ def get_available_tools(
 
     # Conditionally add tools based on config
     builtin_tools = BUILTIN_TOOLS.copy()
+    if include_upload_tool:
+        builtin_tools.append(list_uploaded_files)
     skill_evolution_config = getattr(config, "skill_evolution", None)
     if getattr(skill_evolution_config, "enabled", False):
         from deerflow.tools.skill_manage_tool import skill_manage_tool
@@ -116,8 +123,6 @@ def get_available_tools(
     # made through the Gateway API (which runs in a separate process) are immediately
     # reflected when loading MCP tools.
     mcp_tools = []
-    # Reset deferred registry upfront to prevent stale state from previous calls
-    reset_deferred_registry()
     if include_mcp:
         try:
             from deerflow.config.extensions_config import ExtensionsConfig
@@ -129,18 +134,13 @@ def get_available_tools(
                 if mcp_tools:
                     logger.info(f"Using {len(mcp_tools)} cached MCP tool(s)")
 
-                    # When tool_search is enabled, register MCP tools in the
-                    # deferred registry and add tool_search to builtin tools.
-                    if config.tool_search.enabled:
-                        from deerflow.tools.builtins.tool_search import DeferredToolRegistry, set_deferred_registry
-                        from deerflow.tools.builtins.tool_search import tool_search as tool_search_tool
-
-                        registry = DeferredToolRegistry()
-                        for t in mcp_tools:
-                            registry.register(t)
-                        set_deferred_registry(registry)
-                        builtin_tools.append(tool_search_tool)
-                        logger.info(f"Tool search active: {len(mcp_tools)} tools deferred")
+                    # Tag MCP-sourced tools so deferred-tool assembly at each
+                    # agent construction site can identify them. Lead agents
+                    # assemble their full configured MCP catalog and apply active
+                    # skill policy at runtime; subagents may pass an already
+                    # policy-filtered list because their skills load at startup.
+                    for t in mcp_tools:
+                        tag_mcp_tool(t)
         except ImportError:
             logger.warning("MCP module not available. Install 'langchain-mcp-adapters' package to enable MCP tools.")
         except Exception as e:
@@ -168,7 +168,7 @@ def get_available_tools(
     # Deduplicate by tool name — config-loaded tools take priority, followed by
     # built-ins, MCP tools, and ACP tools.  Duplicate names cause the LLM to
     # receive ambiguous or concatenated function schemas (issue #1803).
-    all_tools = loaded_tools + builtin_tools + mcp_tools + acp_tools
+    all_tools = [_ensure_sync_invocable_tool(t) for t in loaded_tools + builtin_tools + mcp_tools + acp_tools]
     seen_names: set[str] = set()
     unique_tools: list[BaseTool] = []
     for t in all_tools:
